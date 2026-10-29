@@ -1,0 +1,65 @@
+name: kv-bench
+
+on:
+  workflow_dispatch:            # 수동 실행만 (공개 저장소 보안)
+    inputs:
+      model:
+        description: "모델"
+        type: choice
+        options: [qwen, llama, both]
+        default: qwen
+      lengths:
+        description: "프롬프트 길이 (토큰, 쉼표)"
+        type: string
+        default: "128,512,1024,2048,4096"
+      repeats:
+        description: "조건당 반복 횟수"
+        type: string
+        default: "5"
+      storage:
+        description: "저장 방식"
+        type: choice
+        options: ["raw,lz4", "raw", "lz4"]
+        default: "raw,lz4"
+      cache:
+        description: "캐시 조건"
+        type: choice
+        options: ["cold,warm", "cold", "warm"]
+        default: "cold,warm"
+
+concurrency:                    # 동시에 두 개 안 돌게
+  group: kv-bench
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: [self-hosted, kvbench]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run benchmark
+        env:
+          PYTHONUNBUFFERED: "1"
+          MODEL: ${{ inputs.model }}
+          LENGTHS: ${{ inputs.lengths }}
+          REPEATS: ${{ inputs.repeats }}
+          STORAGE: ${{ inputs.storage }}
+          CACHE: ${{ inputs.cache }}
+        run: |
+          OUT="$HOME/aiwork/results/$(date +%Y%m%d_%H%M%S)_run${GITHUB_RUN_NUMBER}"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          "$HOME/aiwork/venv/bin/python" scripts/run_bench.py \
+            --model "$MODEL" --lengths "$LENGTHS" --repeats "$REPEATS" \
+            --storage "$STORAGE" --cache "$CACHE" --out "$OUT"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ github.run_number }}
+          path: ${{ env.OUT }}
+          if-no-files-found: warn
