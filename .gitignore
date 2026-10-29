@@ -1,0 +1,18 @@
+# 결과와 큰 파일은 저장소에 올리지 않음
+results/
+*.gguf
+*.bin
+*.lz4
+*.csv
+*.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 개인 정보
+*secret*
+*private*
+.env
