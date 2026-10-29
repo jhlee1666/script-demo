@@ -6,11 +6,16 @@ llama-server의 슬롯 저장/복원 API로 KV Cache를 SSD에 저장했다가 �
 프롬프트를 처음부터 다시 처리(재계산)하는 경우와 시간을 비교한다.
 
 조건 하나(모델, 길이 N, 반복 r)마다:
-  1. 재계산      : 슬롯 비우기 -> 프롬프트 처리 (기준 출력 A)
+  1. 재계산      : 슬롯 비우기 -> 프롬프트 처리 (재계산 시간)
   2. RAW 저장    : 슬롯 저장 -> fsync (실제 디스크 쓰기까지)
-  3. RAW 복원    : cold(캐시 비움) / warm 각각 복원 -> 같은 요청 (출력 B, A와 비교)
-  4. LZ4 저장    : RAW 파일을 LZ4로 압축 -> fsync, RAW 삭제
-  5. LZ4 복원    : cold / warm 각각 압축 해제 -> 복원 -> 같은 요청
+  3. 기준 출력 A : 저장 직후의 KV 상태에서 생성
+  4. RAW 복원    : cold(캐시 비움) / warm 각각 복원 -> 같은 요청 (출력 B, A와 비교)
+  5. LZ4 저장    : RAW 파일을 LZ4로 압축 -> fsync, RAW 삭제
+  6. LZ4 복원    : cold / warm 각각 압축 해제 -> 복원 -> 같은 요청
+
+A와 B는 "KV 상태 + 마지막 토큰 1개 계산 + 생성"이라는 같은 경로를 거치므로,
+복원이 정확하면 출력이 비트 단위로 같아야 한다. (프롬프트 전체를 다시 처리한
+결과와 비교하면 배치 크기 차이로 생기는 미세한 수치 차이 때문에 다를 수 있다.)
 결과는 조건마다 CSV 한 줄씩 바로 기록한다(중간에 멈춰도 그때까지 남음).
 
 예시 (짧은 시험):
@@ -298,6 +303,14 @@ def bench_model(args, key, writer, csv_f, out_dir, progress):
             all_tokens = (all_tokens * (need // len(all_tokens) + 1))
         log(f"[{key}] 재료 토큰 {len(all_tokens)}개")
 
+        # 워밍업: 서버를 켠 뒤 첫 요청은 메모리 할당 등으로 느려서 측정에서 제외
+        for _ in range(args.warmup):
+            srv.slot("erase")
+            srv.completion(all_tokens[:min(512, max(args.lengths))], 4)
+        srv.slot("erase")
+        if args.warmup:
+            log(f"[{key}] 워밍업 {args.warmup}회 완료")
+
         for n in args.lengths:
             tokens = all_tokens[:n]
             for rep in range(1, args.repeats + 1):
@@ -307,11 +320,10 @@ def bench_model(args, key, writer, csv_f, out_dir, progress):
                 raw_path = raw_dir / fname
                 lz4_path = lz4_dir / (fname + ".lz4")
 
-                # 1. 재계산 (기준)
+                # 1. 재계산: 프롬프트 처리 시간 (생성은 1토큰만)
                 srv.slot("erase")
-                a = srv.completion(tokens, args.n_predict)
+                a = srv.completion(tokens, 1)
                 ta = a.get("timings", {})
-                ref = a.get("content")
                 base = {
                     "model": key, "n_tokens": n, "rep": rep,
                     "recompute_prompt_n": ta.get("prompt_n"),
@@ -325,6 +337,9 @@ def bench_model(args, key, writer, csv_f, out_dir, progress):
                 base["fsync_ms"] = round(ms_since(t0), 3)
                 base["save_ms"] = round(s.get("timings", {}).get("save_ms", 0), 3)
                 base["raw_bytes"] = raw_path.stat().st_size
+
+                # 3. 기준 출력 A: 저장한 것과 같은 KV 상태에서 생성
+                ref = srv.completion(tokens, args.n_predict).get("content")
 
                 def record(storage, cache, extra, restore_res, t_start):
                     pn, pms, match = resume(srv, tokens, args, ref)
@@ -418,6 +433,7 @@ def parse_args():
     p.add_argument("--evict", default="drop", choices=["drop", "fadvise"],
                    help="cold 만드는 방법: drop(전체 캐시 비우기, sudo) / fadvise(해당 파일만)")
     p.add_argument("--n-predict", type=int, default=32, help="생성 토큰 수 (출력 비교용)")
+    p.add_argument("--warmup", type=int, default=2, help="측정 전 워밍업 요청 횟수")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--ctx", type=int, default=0, help="컨텍스트 크기 (0이면 자동)")
     p.add_argument("--port", type=int, default=8080)
